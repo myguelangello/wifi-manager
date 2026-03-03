@@ -1,8 +1,5 @@
 package com.example.wifimanagerapp
 
-import android.net.wifi.WifiNetworkSpecifier
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -11,12 +8,14 @@ import android.content.IntentFilter
 import android.net.*
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
+import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.annotation.RequiresApi
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -24,14 +23,18 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -39,6 +42,15 @@ class MainActivity : ComponentActivity() {
     private lateinit var connectivityManager: ConnectivityManager
 
     private var scanReceiver: BroadcastReceiver? = null
+
+    // ---------- Snackbar bridge (Android -> Compose) ----------
+    @Volatile
+    private var uiMessageDispatcher: ((String) -> Unit)? = null
+
+    private fun showUiMessage(msg: String) {
+        uiMessageDispatcher?.invoke(msg)
+    }
+    // ---------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,7 +69,9 @@ class MainActivity : ComponentActivity() {
                     canUseWifiScan = { hasRequiredPermissions() },
                     registerScanUpdates = { onResults -> registerScanReceiver(onResults) },
                     unregisterScanUpdates = { unregisterScanReceiver() },
-                    getCachedResults = { getScanResultsSafely() }
+                    getCachedResults = { getScanResultsSafely() },
+                    onDisconnect = { disconnectFromBoundNetwork() },
+                    bindUiMessageDispatcher = { dispatcher -> uiMessageDispatcher = dispatcher }
                 )
             }
         }
@@ -66,6 +80,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         unregisterScanReceiver()
+        uiMessageDispatcher = null
     }
 
     // -------------------------
@@ -98,8 +113,8 @@ class MainActivity : ComponentActivity() {
     // Wi-Fi Scan
     // -------------------------
     private fun startWifiScan() {
-        // startScan pode falhar por rate limit; mesmo assim, você pode ler resultados cacheados.
         runCatching { wifiManager.startScan() }
+            .onFailure { showUiMessage("Falha ao iniciar scan (rate limit/estado).") }
     }
 
     private fun getScanResultsSafely(): List<ScanResult> {
@@ -117,7 +132,7 @@ class MainActivity : ComponentActivity() {
             override fun onReceive(context: Context, intent: Intent) {
                 val updated = getScanResultsSafely()
                     .filter { it.SSID.isNotBlank() }
-                    .distinctBy { it.BSSID } // pode ajustar para SSID se preferir
+                    .distinctBy { it.BSSID }
                     .sortedByDescending { it.level }
 
                 onResults(updated)
@@ -129,7 +144,6 @@ class MainActivity : ComponentActivity() {
             IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
         )
 
-        // Entrega resultados iniciais (cacheados) para não ficar “tela vazia”
         val cached = getScanResultsSafely()
             .filter { it.SSID.isNotBlank() }
             .distinctBy { it.BSSID }
@@ -139,9 +153,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun unregisterScanReceiver() {
-        scanReceiver?.let {
-            runCatching { unregisterReceiver(it) }
-        }
+        scanReceiver?.let { runCatching { unregisterReceiver(it) } }
         scanReceiver = null
     }
 
@@ -149,63 +161,109 @@ class MainActivity : ComponentActivity() {
     // Connect / Disconnect (NetworkSpecifier)
     // -------------------------
     private fun connectToNetwork(scan: ScanResult, passwordOrNull: String?) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            showUiMessage("Conexão por NetworkSpecifier requer Android 10+ (API 29).")
+            return
+        }
+
+        val ssid = scan.SSID
+        val caps = scan.capabilities.orEmpty()
 
         val isOpen = isOpenNetwork(scan)
-        val ssid = scan.SSID
 
-        val specBuilder = WifiNetworkSpecifier.Builder()
-            .setSsid(ssid)
+        // Observação:
+        // - WPA3-Personal aparece como "SAE"
+        // - WPA2-Personal normalmente contém "WPA" / "WPA2"
+        // - Enterprise/EAP -> "EAP" (não suportado neste fluxo)
+        val isEnterprise = caps.contains("EAP")
+        val supportsWpa3 = caps.contains("SAE")
+        val supportsWpa2 = caps.contains("WPA") || caps.contains("WPA2")
 
-        if (!isOpen) {
-            // WPA2/WPA3: para exemplo, usamos passphrase. (A API também tem setWpa2Passphrase / setWpa3Passphrase)
-            val pwd = passwordOrNull.orEmpty()
-            if (pwd.isBlank()) return
-            specBuilder.setWpa2Passphrase(pwd)
+        if (isEnterprise) {
+            showUiMessage("Rede Enterprise (EAP) não suportada neste modo.")
+            return
         }
 
-        val specifier: NetworkSpecifier = specBuilder.build()
+        try {
+            val specBuilder = WifiNetworkSpecifier.Builder().setSsid(ssid)
 
-        val request = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .setNetworkSpecifier(specifier)
-            .build()
+            if (!isOpen) {
+                val pwd = passwordOrNull.orEmpty()
+                if (pwd.length < 8) {
+                    showUiMessage("Senha inválida (mínimo 8 caracteres).")
+                    return
+                }
 
-        // Remove callback anterior para evitar “conexões penduradas”
-        currentNetworkCallback?.let { connectivityManager.unregisterNetworkCallback(it) }
-        currentNetworkCallback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                // Bind para que o tráfego do app use esta rede Wi-Fi
-                connectivityManager.bindProcessToNetwork(network)
+                // Preferir WPA3 quando disponível; em redes transition, pode funcionar melhor assim.
+                when {
+                    supportsWpa3 -> {
+                        try {
+                            specBuilder.setWpa3Passphrase(pwd)
+                        } catch (e: IllegalArgumentException) {
+                            // Fallback para WPA2 se a ROM/driver não aceitar WPA3 aqui
+                            if (supportsWpa2) {
+                                specBuilder.setWpa2Passphrase(pwd)
+                            } else {
+                                throw e
+                            }
+                        }
+                    }
+
+                    supportsWpa2 -> specBuilder.setWpa2Passphrase(pwd)
+
+                    else -> {
+                        showUiMessage("Tipo de segurança não suportado: $caps")
+                        return
+                    }
+                }
             }
 
-            override fun onUnavailable() {
-                // Falhou / usuário cancelou / senha errada / etc
+            val specifier: NetworkSpecifier = specBuilder.build()
+
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .setNetworkSpecifier(specifier)
+                .build()
+
+            currentNetworkCallback?.let { connectivityManager.unregisterNetworkCallback(it) }
+            currentNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    connectivityManager.bindProcessToNetwork(network)
+                    showUiMessage("Conectado em $ssid")
+                }
+
+                override fun onUnavailable() {
+                    showUiMessage("Não foi possível conectar em $ssid (cancelado ou falhou).")
+                }
+
+                override fun onLost(network: Network) {
+                    connectivityManager.bindProcessToNetwork(null)
+                    showUiMessage("Conexão perdida: $ssid")
+                }
             }
 
-            override fun onLost(network: Network) {
-                // Se perdeu, desfaz o bind
-                connectivityManager.bindProcessToNetwork(null)
-            }
+            connectivityManager.requestNetwork(request, currentNetworkCallback!!)
+
+        } catch (e: IllegalArgumentException) {
+            showUiMessage("Falha ao conectar: senha/param inválido. (${e.message})")
+        } catch (e: SecurityException) {
+            showUiMessage("Sem permissão/estado inválido para conectar. (${e.message})")
+        } catch (e: Exception) {
+            showUiMessage("Erro inesperado ao conectar. (${e.message})")
         }
-
-        connectivityManager.requestNetwork(request, currentNetworkCallback!!)
     }
 
     private var currentNetworkCallback: ConnectivityManager.NetworkCallback? = null
 
     private fun disconnectFromBoundNetwork() {
-        // “Desconectar” aqui significa: remover o bind do processo e cancelar a request.
         connectivityManager.bindProcessToNetwork(null)
-        currentNetworkCallback?.let { cb ->
-            runCatching { connectivityManager.unregisterNetworkCallback(cb) }
-        }
+        currentNetworkCallback?.let { cb -> runCatching { connectivityManager.unregisterNetworkCallback(cb) } }
         currentNetworkCallback = null
+        showUiMessage("Desconectado (bind removido).")
     }
 
     private fun isOpenNetwork(scan: ScanResult): Boolean {
         val caps = scan.capabilities ?: ""
-        // redes abertas geralmente não têm WPA/WEP/SAE/EAP etc
         return !(caps.contains("WPA") || caps.contains("WEP") || caps.contains("SAE") || caps.contains("EAP"))
     }
 
@@ -225,7 +283,9 @@ class MainActivity : ComponentActivity() {
         canUseWifiScan: () -> Boolean,
         registerScanUpdates: ((List<ScanResult>) -> Unit) -> Unit,
         unregisterScanUpdates: () -> Unit,
-        getCachedResults: () -> List<ScanResult>
+        getCachedResults: () -> List<ScanResult>,
+        onDisconnect: () -> Unit,
+        bindUiMessageDispatcher: ((String) -> Unit) -> Unit
     ) {
         var networks by remember { mutableStateOf(getCachedResults()) }
         var showPwdDialog by remember { mutableStateOf(false) }
@@ -233,12 +293,25 @@ class MainActivity : ComponentActivity() {
         var password by remember { mutableStateOf("") }
         var showPermissionUi by remember { mutableStateOf(false) }
 
+        // novo: mostrar/ocultar senha
+        var showPassword by remember { mutableStateOf(false) }
+
+        val snackbarHostState = remember { SnackbarHostState() }
+        val scope = rememberCoroutineScope()
+
+        LaunchedEffect(Unit) {
+            bindUiMessageDispatcher { message ->
+                scope.launch { snackbarHostState.showSnackbar(message) }
+            }
+        }
+
         val permissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions()
         ) { _ ->
             showPermissionUi = !canUseWifiScan()
-            // Atualiza lista ao conceder
-            networks = getCachedResults().filter { it.SSID.isNotBlank() }.sortedByDescending { it.level }
+            networks = getCachedResults()
+                .filter { it.SSID.isNotBlank() }
+                .sortedByDescending { it.level }
             onRequestScan()
         }
 
@@ -257,6 +330,7 @@ class MainActivity : ComponentActivity() {
         }
 
         Scaffold(
+            snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
             topBar = {
                 TopAppBar(
                     title = { Text("Wi-Fi Manager") },
@@ -286,6 +360,15 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    OutlinedButton(onClick = onDisconnect) { Text("Desconectar") }
+                }
+
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(12.dp),
@@ -304,6 +387,7 @@ class MainActivity : ComponentActivity() {
                                 selectedNetwork = scan
                                 if (!isOpenNetwork(scan)) {
                                     password = ""
+                                    showPassword = false
                                     showPwdDialog = true
                                 } else {
                                     onConnect(scan, null)
@@ -321,18 +405,36 @@ class MainActivity : ComponentActivity() {
                     text = {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("Digite a senha do Wi-Fi:")
+
                             OutlinedTextField(
                                 value = password,
                                 onValueChange = { password = it },
                                 singleLine = true,
-                                visualTransformation = PasswordVisualTransformation(),
-                                label = { Text("Senha") }
+                                label = { Text("Senha") },
+                                visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+                                trailingIcon = {
+                                    IconButton(onClick = { showPassword = !showPassword }) {
+                                        Icon(
+                                            imageVector = if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                            contentDescription = if (showPassword) "Ocultar senha" else "Mostrar senha"
+                                        )
+                                    }
+                                }
                             )
                         }
                     },
                     confirmButton = {
                         TextButton(onClick = {
                             val scan = selectedNetwork!!
+
+                            // valida antes de fechar o diálogo
+                            if (password.length < 8) {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Senha inválida (mínimo 8 caracteres).")
+                                }
+                                return@TextButton
+                            }
+
                             showPwdDialog = false
                             onConnect(scan, password)
                         }) { Text("Conectar") }
@@ -355,7 +457,10 @@ class MainActivity : ComponentActivity() {
                 .fillMaxWidth()
                 .padding(12.dp)
         ) {
-            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Text(
                     "Permissões necessárias para listar redes Wi-Fi",
                     style = MaterialTheme.typography.titleMedium
