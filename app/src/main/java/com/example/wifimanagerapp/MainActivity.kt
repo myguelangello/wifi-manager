@@ -1,5 +1,8 @@
 package com.example.wifimanagerapp
 
+import android.net.wifi.WifiNetworkSpecifier
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -162,7 +165,7 @@ class MainActivity : ComponentActivity() {
             specBuilder.setWpa2Passphrase(pwd)
         }
 
-        val specifier = specBuilder.build()
+        val specifier: NetworkSpecifier = specBuilder.build()
 
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
