@@ -4,6 +4,7 @@ hidden = [".config", ".git", "generated-icon.png", "node_modules", "dist"]
 
 [nix]
 channel = "stable-24_05"
+packages = ["kotlin", "gradle"]
 
 [[ports]]
 localPort = 5000
@@ -35,5 +36,7 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "npm run dev"
-waitForPort = 5000
+args = "./gradlew run"
+
+[workflows.workflow.metadata]
+outputType = "console"
